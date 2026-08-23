@@ -1,6 +1,7 @@
 """evovision: multi-objective evolutionary NAS for efficient vision."""
 
-from evovision import search_space
+from evovision import baselines, search_space
+from evovision.baselines import exhaustive_front, front_hypervolume, random_search
 from evovision.cache import ArchitectureCache, memoize
 from evovision.evolve import evolve
 from evovision.models import ConvNet, build_model
@@ -39,4 +40,8 @@ __all__ = [
     "DIM",
     "N_STAGES",
     "search_space",
+    "baselines",
+    "random_search",
+    "exhaustive_front",
+    "front_hypervolume",
 ]
