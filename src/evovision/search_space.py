@@ -73,3 +73,17 @@ def params(x: np.ndarray, input_channels: int = _INPUT_CHANNELS) -> int:
             c_in = c_out
     total += _N_CLASSES * c_in + _N_CLASSES
     return total
+
+
+# Hand-designed baseline architectures, as continuous genomes.
+BASELINES = {
+    "tiny": [0, 0, 0] * N_STAGES,    # width 8,  kernel 3, depth 1
+    "small": [1, 0, 0] * N_STAGES,   # width 16, kernel 3, depth 1
+    "medium": [2, 0, 1] * N_STAGES,  # width 24, kernel 3, depth 2
+    "wide": [3, 1, 1] * N_STAGES,    # width 32, kernel 5, depth 2
+}
+
+
+def baseline_genomes() -> dict[str, np.ndarray]:
+    """Return the named hand-designed baseline architectures."""
+    return {name: np.array(g, dtype=float) for name, g in BASELINES.items()}
