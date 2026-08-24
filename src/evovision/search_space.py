@@ -1,21 +1,47 @@
-"""The macro search space: a small family of convolutional networks.
+"""The macro search space: a family of convolutional networks.
 
-Each candidate architecture is a continuous genome ``x`` in ``[0, bounds]`` that
-rounds to a discrete configuration: three stages, each with a width, kernel
-size, and depth. FLOPs and parameter counts are computed analytically so the
-efficiency objective is free (no forward pass needed).
+Each candidate is a continuous genome decoded to three stages, each with a
+width, kernel size, depth, **block type** and **expansion ratio**. FLOPs and
+parameter counts are computed analytically so the efficiency objective is free
+(no forward pass needed) and exact (it matches what ``models.build_model``
+constructs, checked in the tests).
+
+Why the block type matters
+--------------------------
+The original space was three independent, monotone axes -- wider, bigger
+kernel, deeper, each strictly more accurate and more expensive. A space like
+that has nothing for a search to exploit that uniform sampling does not also
+find, and the benchmark showed exactly that: evolution reached 96.0% of the
+exact Pareto front and random search 95.4%, indistinguishable at p=1.000.
+
+Block type creates *interaction*. An inverted residual's cost is dominated by
+its expansion ratio rather than its width, so the cheapest way to buy accuracy
+depends on which block a stage uses -- and the best width for one block type is
+not the best width for another. That is the structure a search can exploit and
+sampling cannot.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-WIDTHS = [8, 16, 24, 32]
-KERNELS = [3, 5]
-DEPTHS = [1, 2]
+WIDTHS = [8, 16, 24, 32, 48, 64]
+KERNELS = [3, 5, 7]
+DEPTHS = [1, 2, 3]
+#: ``conv``: conv-bn-relu. ``residual``: the same plus a skip (with a 1x1
+#: projection when the channel count changes). ``inverted_residual``: MobileNetV2's
+#: MBConv -- 1x1 expand, depthwise k*k, 1x1 project, skip when shapes allow.
+BLOCKS = ["conv", "residual", "inverted_residual"]
+#: Expansion ratio, used only by ``inverted_residual``.
+EXPANSIONS = [1, 3, 6]
 
 N_STAGES = 3
-DIM = 3 * N_STAGES  # (width, kernel, depth) per stage
+GENES_PER_STAGE = 5  # width, kernel, depth, block, expansion
+DIM = GENES_PER_STAGE * N_STAGES
+
+#: Above this many architectures, enumerate_genomes() refuses rather than
+#: silently trying to materialise the whole space.
+MAX_ENUMERABLE = 2_000_000
 
 _INPUT_CHANNELS = 3
 _INPUT_SIZE = 32
@@ -24,7 +50,8 @@ _N_CLASSES = 10
 
 def n_architectures() -> int:
     """Total number of distinct architectures in the search space."""
-    return (len(WIDTHS) * len(KERNELS) * len(DEPTHS)) ** N_STAGES
+    per_stage = len(WIDTHS) * len(KERNELS) * len(DEPTHS) * len(BLOCKS) * len(EXPANSIONS)
+    return per_stage**N_STAGES
 
 
 def bounds() -> np.ndarray:
@@ -39,8 +66,8 @@ def bounds() -> np.ndarray:
     lo: list[int] = []
     hi: list[int] = []
     for _ in range(N_STAGES):
-        lo += [0, 0, 0]
-        hi += [len(WIDTHS), len(KERNELS), len(DEPTHS)]
+        lo += [0, 0, 0, 0, 0]
+        hi += [len(WIDTHS), len(KERNELS), len(DEPTHS), len(BLOCKS), len(EXPANSIONS)]
     return np.array(list(zip(lo, hi)), dtype=float)
 
 
@@ -52,12 +79,21 @@ def _decode(value: float, choices: list[int]) -> int:
 def to_config(x: np.ndarray) -> dict:
     """Decode a continuous genome into a discrete architecture configuration."""
     x = np.asarray(x, dtype=float).ravel()
-    widths, kernels, depths = [], [], []
+    widths, kernels, depths, blocks, expansions = [], [], [], [], []
     for s in range(N_STAGES):
-        widths.append(WIDTHS[_decode(x[3 * s], WIDTHS)])
-        kernels.append(KERNELS[_decode(x[3 * s + 1], KERNELS)])
-        depths.append(DEPTHS[_decode(x[3 * s + 2], DEPTHS)])
-    return {"widths": widths, "kernels": kernels, "depths": depths}
+        base = GENES_PER_STAGE * s
+        widths.append(WIDTHS[_decode(x[base], WIDTHS)])
+        kernels.append(KERNELS[_decode(x[base + 1], KERNELS)])
+        depths.append(DEPTHS[_decode(x[base + 2], DEPTHS)])
+        blocks.append(BLOCKS[_decode(x[base + 3], BLOCKS)])
+        expansions.append(EXPANSIONS[_decode(x[base + 4], EXPANSIONS)])
+    return {
+        "widths": widths,
+        "kernels": kernels,
+        "depths": depths,
+        "blocks": blocks,
+        "expansions": expansions,
+    }
 
 
 def config_key(x: np.ndarray) -> tuple:
@@ -68,20 +104,43 @@ def config_key(x: np.ndarray) -> tuple:
     search has actually covered.
     """
     cfg = to_config(x)
-    return (tuple(cfg["widths"]), tuple(cfg["kernels"]), tuple(cfg["depths"]))
+    return (
+        tuple(cfg["widths"]),
+        tuple(cfg["kernels"]),
+        tuple(cfg["depths"]),
+        tuple(cfg["blocks"]),
+        # the expansion ratio only changes the network for inverted residuals,
+        # so two genomes differing only there are the *same* architecture
+        tuple(e if b == "inverted_residual" else 0 for e, b in zip(cfg["expansions"], cfg["blocks"])),
+    )
 
 
 def enumerate_genomes() -> np.ndarray:
     """Every architecture in the space, as an ``(n_architectures, DIM)`` array.
 
-    The space is small enough to enumerate exhaustively, which makes the exact
-    Pareto front computable and gives any search a ground truth to be measured
-    against.
+    Raises when the space is too large to materialise. The exact Pareto front is
+    a wonderful thing to have and it is worth keeping this path working, but a
+    space you can enumerate is a space a search cannot distinguish itself in --
+    so growing past this point is the intended direction, not a regression. Use
+    :func:`sample_genomes` for a random subset instead.
     """
     import itertools
 
+    total = n_architectures()
+    if total > MAX_ENUMERABLE:
+        raise ValueError(
+            f"the search space holds {total:,} architectures, over the "
+            f"{MAX_ENUMERABLE:,} enumeration limit. Use sample_genomes(n) for a "
+            "random subset, or shrink the space with a preset."
+        )
     per_stage = list(
-        itertools.product(range(len(WIDTHS)), range(len(KERNELS)), range(len(DEPTHS)))
+        itertools.product(
+            range(len(WIDTHS)),
+            range(len(KERNELS)),
+            range(len(DEPTHS)),
+            range(len(BLOCKS)),
+            range(len(EXPANSIONS)),
+        )
     )
     return np.array(
         [[g for stage in combo for g in stage] for combo in itertools.product(per_stage, repeat=N_STAGES)],
@@ -89,56 +148,101 @@ def enumerate_genomes() -> np.ndarray:
     )
 
 
-def flops(x: np.ndarray, input_channels: int = _INPUT_CHANNELS, input_size: int = _INPUT_SIZE) -> float:
-    """Total multiply-accumulate operations (MACs) for a candidate.
+def sample_genomes(n: int, seed: int = 0) -> np.ndarray:
+    """``n`` architectures drawn uniformly from the space, without duplicates.
 
-    Counts conv and linear MACs only, matching the convention used to report
-    MobileNet/EfficientNet costs -- and matching what :func:`models.build_model`
-    actually constructs. The convolutions carry no bias term (``bias=False``),
-    so none is counted; batch-norm contributes no MACs at inference, where it
-    folds into the preceding convolution.
+    The replacement for :func:`enumerate_genomes` once the space is too large to
+    enumerate. Deduplicates on the decoded architecture, so ``n`` distinct
+    networks come back rather than ``n`` genomes that may collide.
     """
+    rng = np.random.default_rng(seed)
+    lo, hi = bounds()[:, 0], bounds()[:, 1]
+    seen: dict[tuple, np.ndarray] = {}
+    attempts = 0
+    while len(seen) < n and attempts < 50 * n + 1000:
+        batch = rng.uniform(lo, hi, size=(max(n, 64), DIM))
+        for row in batch:
+            key = config_key(row)
+            if key not in seen:
+                seen[key] = row
+                if len(seen) >= n:
+                    break
+        attempts += len(batch)
+    return np.array(list(seen.values()), dtype=float)
+
+
+def _block_cost(kind, c_in, c_out, k, expansion, h, w):
+    """``(macs, params)`` for one block at resolution ``h x w``.
+
+    Mirrors models.build_block exactly. Convolutions are bias-free, batch-norm
+    contributes 2 parameters per channel and no inference MACs (it folds into
+    the preceding convolution), and only conv/linear MACs are counted -- the
+    convention used to report MobileNet/EfficientNet costs.
+    """
+    if kind == "conv":
+        macs = c_out * h * w * k * k * c_in
+        params = k * k * c_in * c_out + 2 * c_out
+        return macs, params
+
+    if kind == "residual":
+        macs = c_out * h * w * k * k * c_in
+        params = k * k * c_in * c_out + 2 * c_out
+        if c_in != c_out:  # 1x1 projection on the skip path
+            macs += c_out * h * w * c_in
+            params += c_in * c_out + 2 * c_out
+        return macs, params
+
+    if kind == "inverted_residual":
+        hidden = max(1, c_in * expansion)
+        macs = params = 0
+        if expansion != 1:  # 1x1 expand
+            macs += hidden * h * w * c_in
+            params += c_in * hidden + 2 * hidden
+        macs += hidden * h * w * k * k  # depthwise: groups == hidden
+        params += k * k * hidden + 2 * hidden
+        macs += c_out * h * w * hidden  # 1x1 project
+        params += hidden * c_out + 2 * c_out
+        return macs, params
+
+    raise ValueError(f"unknown block type {kind!r}")
+
+
+def _walk(x: np.ndarray, input_channels: int, input_size: int):
+    """Yield ``(macs, params)`` per block, tracking channels and resolution."""
     cfg = to_config(x)
-    total = 0.0
     c_in, h, w = input_channels, input_size, input_size
     for s in range(N_STAGES):
         c_out = cfg["widths"][s]
         k = cfg["kernels"][s]
+        kind = cfg["blocks"][s]
+        expansion = cfg["expansions"][s]
         for _ in range(cfg["depths"][s]):
-            total += c_out * h * w * k * k * c_in
+            yield _block_cost(kind, c_in, c_out, k, expansion, h, w)
             c_in = c_out
         h //= 2
         w //= 2
-    total += _N_CLASSES * c_in
-    return float(total)
+    yield _N_CLASSES * c_in, _N_CLASSES * c_in + _N_CLASSES  # classifier
+
+
+def flops(x: np.ndarray, input_channels: int = _INPUT_CHANNELS, input_size: int = _INPUT_SIZE) -> float:
+    """Total multiply-accumulate operations (MACs) for a candidate."""
+    return float(sum(macs for macs, _ in _walk(x, input_channels, input_size)))
 
 
 def params(x: np.ndarray, input_channels: int = _INPUT_CHANNELS) -> int:
-    """Number of trainable parameters for a candidate.
-
-    Matches :func:`models.build_model` exactly: bias-free convolutions, two
-    learnable parameters per batch-norm channel, and a biased classifier.
-    """
-    cfg = to_config(x)
-    total = 0
-    c_in = input_channels
-    for s in range(N_STAGES):
-        c_out = cfg["widths"][s]
-        k = cfg["kernels"][s]
-        for _ in range(cfg["depths"][s]):
-            total += k * k * c_in * c_out  # conv weight, bias=False
-            total += 2 * c_out  # batch-norm weight and bias
-            c_in = c_out
-    total += _N_CLASSES * c_in + _N_CLASSES  # classifier weight and bias
-    return total
+    """Number of trainable parameters for a candidate."""
+    return int(sum(p for _, p in _walk(x, input_channels, _INPUT_SIZE)))
 
 
 # Hand-designed baseline architectures, as continuous genomes.
 BASELINES = {
-    "tiny": [0, 0, 0] * N_STAGES,    # width 8,  kernel 3, depth 1
-    "small": [1, 0, 0] * N_STAGES,   # width 16, kernel 3, depth 1
-    "medium": [2, 0, 1] * N_STAGES,  # width 24, kernel 3, depth 2
-    "wide": [3, 1, 1] * N_STAGES,    # width 32, kernel 5, depth 2
+    # width, kernel, depth, block, expansion  (indices into the lists above)
+    "tiny": [0, 0, 0, 0, 0] * N_STAGES,        # 8ch  k3 d1 conv
+    "small": [1, 0, 0, 0, 0] * N_STAGES,       # 16ch k3 d1 conv
+    "medium": [2, 0, 1, 0, 0] * N_STAGES,      # 24ch k3 d2 conv
+    "wide": [3, 1, 1, 0, 0] * N_STAGES,        # 32ch k5 d2 conv
+    "resnet_ish": [3, 0, 1, 1, 0] * N_STAGES,  # 32ch k3 d2 residual
+    "mobile_ish": [4, 0, 1, 2, 1] * N_STAGES,  # 48ch k3 d2 inverted residual, e=3
 }
 
 

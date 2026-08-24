@@ -17,13 +17,38 @@ def _mock_accuracy(X: np.ndarray) -> np.ndarray:
     return np.array(out)
 
 
-def test_build_model_and_forward():
+@pytest.mark.parametrize("block", [0, 1, 2])
+def test_build_model_and_forward(block):
+    """Every block type must build and run at the declared input shape."""
     torch = pytest.importorskip("torch")
+
+    from evovision import search_space
     from evovision.models import build_model
 
-    model = build_model(np.array([1.0, 1.0, 1.0] * 3))
+    genome = np.array([1.0, 1.0, 1.0, float(block), 1.0] * search_space.N_STAGES)
+    model = build_model(genome)
     out = model(torch.randn(2, 3, 32, 32))
     assert out.shape == (2, 10)
+
+
+def test_residual_and_inverted_blocks_use_their_skip_connections():
+    """A skip is the point of these blocks; assert it is actually wired up."""
+    torch = pytest.importorskip("torch")
+
+    from evovision.models import InvertedResidualBlock, ResidualBlock
+
+    x = torch.randn(2, 16, 8, 8)
+
+    same = ResidualBlock(16, 16, 3)
+    same.body[0].weight.data.zero_()  # zero the conv: only the skip survives
+    same.body[1].weight.data.fill_(1.0)
+    same.body[1].bias.data.zero_()
+    assert same.project is None, "matched channels need no projection"
+    torch.testing.assert_close(same(x), torch.relu(x))
+
+    mb = InvertedResidualBlock(16, 16, 3, expansion=3)
+    assert mb.use_skip, "matched channels should carry a skip"
+    assert not InvertedResidualBlock(16, 32, 3, expansion=3).use_skip
 
 
 def test_evolve_finds_pareto_tradeoff():
