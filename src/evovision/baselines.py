@@ -6,14 +6,17 @@ Reproducibility for NAS*, UAI 2019; Yang, Esperança & Carlucci, *NAS Evaluation
 is Frustratingly Hard*, ICLR 2020). A search that cannot beat uniform sampling
 at a matched budget has not been shown to search.
 
-This space is small enough to enumerate (4,096 architectures), so two stronger
-statements are available than usual:
+Random search here samples *distinct* architectures, which is a considerably
+harder baseline than sampling genomes -- most genomes decode to a network
+something else already decoded to.
 
-* random search can sample *distinct* architectures without replacement, which
-  is a considerably harder baseline than sampling genomes;
-* the exact Pareto front is computable by brute force whenever the accuracy
-  function is cheap enough to run on every architecture, giving searches a
-  ground truth rather than a relative comparison.
+The exact Pareto front is available by brute force while the space stays small
+enough to enumerate. It no longer is: with block types the space holds ~115M
+architectures, so :func:`exhaustive_front` raises and
+:func:`reference_front` falls back to a large random sample. That is the
+intended direction -- a space you can enumerate is a space a search cannot
+distinguish itself in -- but it means the ground truth becomes an estimate, and
+this module says so rather than quietly changing what the number means.
 """
 
 from __future__ import annotations
@@ -46,10 +49,15 @@ def random_search(
     strongest form of the baseline, and the fair comparison for a search that
     also caches.
     """
-    genomes = search_space.enumerate_genomes()
-    rng = np.random.default_rng(seed)
-    budget = min(budget, len(genomes))
-    chosen = genomes[rng.choice(len(genomes), size=budget, replace=False)]
+    total = search_space.n_architectures()
+    budget = min(budget, total)
+    if total <= search_space.MAX_ENUMERABLE:
+        genomes = search_space.enumerate_genomes()
+        rng = np.random.default_rng(seed)
+        chosen = genomes[rng.choice(len(genomes), size=budget, replace=False)]
+    else:
+        # Too large to enumerate; sample distinct architectures directly.
+        chosen = search_space.sample_genomes(budget, seed=seed)
 
     errors = np.asarray(accuracy_fn(chosen), dtype=float).ravel()
     macs = np.array([search_space.flops(g) for g in chosen])
@@ -64,13 +72,41 @@ def random_search(
     }
 
 
+def reference_front(
+    accuracy_fn: Callable[[np.ndarray], np.ndarray], n_samples: int = 20_000, seed: int = 0
+) -> dict:
+    """The best available stand-in for ground truth.
+
+    Enumerates the space exactly when it is small enough; otherwise evaluates a
+    large random sample and reports ``exact=False``. A sampled front is an
+    *under*-estimate of the true front, so "percentage of the reference front"
+    read against it can exceed 100% -- which is a signal that the reference
+    needs more samples, not that the search beat optimality.
+    """
+    if search_space.n_architectures() <= search_space.MAX_ENUMERABLE:
+        out = exhaustive_front(accuracy_fn)
+        out["exact"] = True
+        return out
+
+    genomes = search_space.sample_genomes(n_samples, seed=seed)
+    errors = np.asarray(accuracy_fn(genomes), dtype=float).ravel()
+    macs = np.array([search_space.flops(g) for g in genomes])
+    objectives = np.column_stack([errors, macs])
+    front_g, front_o = _front(genomes, objectives)
+    return {
+        "solutions": front_g,
+        "objectives": front_o,
+        "architectures_trained": len(genomes),
+        "hypervolume": hypervolume(front_o, REFERENCE_POINT),
+        "exact": False,
+    }
+
+
 def exhaustive_front(accuracy_fn: Callable[[np.ndarray], np.ndarray]) -> dict:
     """The exact Pareto front, by evaluating every architecture in the space.
 
-    Only tractable when ``accuracy_fn`` is cheap (a proxy, a lookup table, or a
-    very short training schedule), but when it is, this is ground truth: it puts
-    a hard ceiling on the hypervolume any search can reach, so "how good is this
-    search" becomes a percentage rather than a comparison.
+    Raises when the space is too large to enumerate -- see
+    :func:`reference_front` for the sampling fallback.
     """
     genomes = search_space.enumerate_genomes()
     errors = np.asarray(accuracy_fn(genomes), dtype=float).ravel()

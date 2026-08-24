@@ -1,7 +1,12 @@
 """evovision: multi-objective evolutionary NAS for efficient vision."""
 
 from evovision import baselines, noise, search_space
-from evovision.baselines import exhaustive_front, front_hypervolume, random_search
+from evovision.baselines import (
+    exhaustive_front,
+    front_hypervolume,
+    random_search,
+    reference_front,
+)
 from evovision.cache import ArchitectureCache, memoize
 from evovision.noise import NoiseFloor, measure_noise_floor
 from evovision.evolve import evolve
@@ -14,6 +19,7 @@ from evovision.search_space import (
     config_key,
     enumerate_genomes,
     flops,
+    sample_genomes,
     n_architectures,
     params,
     to_config,
@@ -47,5 +53,7 @@ __all__ = [
     "NoiseFloor",
     "random_search",
     "exhaustive_front",
+    "reference_front",
+    "sample_genomes",
     "front_hypervolume",
 ]
