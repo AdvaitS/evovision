@@ -17,8 +17,27 @@ def train_and_eval(
     lr: float = 1e-2,
     device: str | None = None,
     seed: int = 0,
+    repeats: int = 1,
 ) -> float:
-    """Train the architecture ``x`` briefly and return validation error in [0, 1]."""
+    """Train the architecture ``x`` briefly and return validation error in [0, 1].
+
+    ``repeats`` averages over that many training seeds. A single short training
+    run is a noisy estimate of an architecture's quality, and when the noise is
+    comparable to the differences between architectures a search ranks noise
+    rather than designs -- the central objection to NAS results in Yang,
+    Esperanca & Carlucci (ICLR 2020). Use
+    :func:`evovision.noise.measure_noise_floor` to find out how many repeats a
+    given setup needs before trusting a single number.
+    """
+    if repeats > 1:
+        return float(
+            np.mean(
+                [
+                    train_and_eval(x, train_loader, val_loader, epochs, lr, device, seed + r)
+                    for r in range(repeats)
+                ]
+            )
+        )
     torch.manual_seed(seed)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(x).to(device)
