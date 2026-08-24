@@ -41,24 +41,51 @@ def synthetic(
     batch_size: int = 64,
     seed: int = 0,
     n_classes: int = 10,
+    noise: float = 1.5,
 ):
     """Return (train_loader, val_loader) over a tiny deterministic toy dataset.
 
-    Labels are ``argmax(X @ W^T)`` for a fixed projection ``W``, so the task is
-    learnable but fast — useful for smoke-testing a search without downloading
-    CIFAR-10.
+    Each class is a distinct oriented sinusoidal grating buried in noise. The
+    task is deliberately *convolutional*: orientation and spatial frequency are
+    exactly what small conv filters detect, and channel statistics survive the
+    global average pool, so a network in this search space can learn it in a
+    couple of epochs.
+
+    The previous version labelled Gaussian noise by ``argmax(X @ W.T)`` for a
+    fixed pixel-space projection. That is linearly separable in principle but
+    unlearnable by *these* models -- global average pooling discards the
+    per-pixel phase the label depends on -- so every architecture scored at
+    chance (~0.90 error for ten classes) and any search over it was ranking
+    noise. A smoke test should exercise the plumbing without silently
+    pretending to optimize.
     """
     import numpy as np
     import torch
     from torch.utils.data import DataLoader, TensorDataset
 
     rng = np.random.default_rng(seed)
-    W = torch.tensor(rng.normal(size=(n_classes, 3 * 32 * 32)), dtype=torch.float32)
+    size = 32
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing="ij")
+
+    # One (frequency, orientation) pair per class, well separated.
+    angles = np.linspace(0.0, np.pi, n_classes, endpoint=False)
+    freqs = 0.10 + 0.16 * (np.arange(n_classes) % 3)
 
     def make(n: int) -> TensorDataset:
-        X = torch.tensor(rng.normal(size=(n, 3, 32, 32)), dtype=torch.float32)
-        y = (X.view(n, -1) @ W.t()).argmax(1)
-        return TensorDataset(X, y)
+        labels = rng.integers(0, n_classes, size=n)
+        images = np.empty((n, 3, size, size), dtype=np.float32)
+        for i, label in enumerate(labels):
+            theta, freq = angles[label], freqs[label]
+            phase = rng.uniform(0, 2 * np.pi)
+            grating = np.sin(
+                2 * np.pi * freq * (xx * np.cos(theta) + yy * np.sin(theta)) + phase
+            )
+            sample = grating[None, :, :] + rng.normal(0.0, noise, size=(3, size, size))
+            images[i] = sample
+        return TensorDataset(
+            torch.tensor(images, dtype=torch.float32),
+            torch.tensor(labels, dtype=torch.long),
+        )
 
     train = DataLoader(make(n_train), batch_size=batch_size, shuffle=True)
     val = DataLoader(make(n_val), batch_size=batch_size, shuffle=False)
