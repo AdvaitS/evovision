@@ -148,6 +148,47 @@ def enumerate_genomes() -> np.ndarray:
     )
 
 
+def encode(x: np.ndarray) -> np.ndarray:
+    """Encode a genome as its *decoded architecture*, for a surrogate to learn on.
+
+    The genome is continuous and highly redundant: a wide band of values for a
+    gene decodes to the same choice, so two genomes far apart in genome space
+    routinely name the same network. A surrogate fitted on raw genomes therefore
+    sees the same target at many different coordinates and has to spend capacity
+    learning the decoder before it can learn anything about architectures.
+
+    This returns the discrete choice indices instead, so genomes that decode
+    identically map to identical surrogate inputs. Ordinal for width, kernel and
+    depth -- they are genuinely ordered, and a surrogate should be able to use
+    that -- and one-hot for block type, which is categorical and has no order to
+    exploit. The unused expansion gene is zeroed for non-inverted blocks, matching
+    config_key.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    out: list[float] = []
+    for s in range(N_STAGES):
+        base = GENES_PER_STAGE * s
+        width = _decode(x[base], WIDTHS)
+        kernel = _decode(x[base + 1], KERNELS)
+        depth = _decode(x[base + 2], DEPTHS)
+        block = _decode(x[base + 3], BLOCKS)
+        expansion = _decode(x[base + 4], EXPANSIONS)
+        out += [float(width), float(kernel), float(depth)]
+        out += [1.0 if block == i else 0.0 for i in range(1, len(BLOCKS))]
+        out.append(float(expansion) if BLOCKS[block] == "inverted_residual" else 0.0)
+    return np.array(out, dtype=float)
+
+
+def encode_many(X: np.ndarray) -> np.ndarray:
+    """:func:`encode` over a batch, returning ``(n, ENCODED_DIM)``."""
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    return np.vstack([encode(row) for row in X]) if len(X) else np.empty((0, ENCODED_DIM))
+
+
+#: Width of the :func:`encode` representation.
+ENCODED_DIM = N_STAGES * (3 + (len(BLOCKS) - 1) + 1)
+
+
 def sample_genomes(n: int, seed: int = 0) -> np.ndarray:
     """``n`` architectures drawn uniformly from the space, without duplicates.
 
